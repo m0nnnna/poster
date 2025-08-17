@@ -271,6 +271,96 @@ def post_to_x(media_paths, status_text, primary_url, x_creds):
     except tweepy.TweepyException as e:
         logging.error(f"Error posting to X: {str(e)} - Response: {getattr(e, 'response', 'No response details')}")
         return False, f"Error posting to X: {str(e)}. Please verify 'Read and Write' permissions at https://developer.x.com or reconfigure credentials."
+    
+class PleromaPostThread(QThread):
+    result = pyqtSignal(str, str, str)  # status_message, post_id, error
+
+    def __init__(self, instance_url, access_token, misskey_url, status_text, misskey_user):
+        super().__init__()
+        self.instance_url = instance_url
+        self.access_token = access_token
+        self.misskey_url = misskey_url
+        self.status_text = status_text
+        self.misskey_user = misskey_user
+
+    def run(self):
+        max_attempts = 5
+        for attempt in range(max_attempts):
+            post_id, error = self.find_pleroma_post()
+            if post_id:
+                success, error = reblog_to_pleroma(self.instance_url, self.access_token, post_id)
+                if success:
+                    self.result.emit("Pleroma (reblog)", post_id, None)
+                    return
+                else:
+                    self.result.emit(f"Error reblogging to Pleroma: {error}", None, error)
+                    return
+            else:
+                logging.warning(f"Attempt {attempt + 1}/{max_attempts} failed to find Pleroma post: {error}")
+                if attempt < max_attempts - 1:
+                    time.sleep(3)  # Increased delay to 3 seconds for federation
+        self.result.emit(
+            f"Error: Could not find Misskey post in Pleroma after {max_attempts} attempts. Ensure Pleroma account follows Misskey user ({self.misskey_user}) at https://fedi.nekos.farm/users/{self.misskey_user}.",
+            None,
+            error
+        )
+
+    def find_pleroma_post(self):
+        if not self.misskey_user or "@" not in self.misskey_user:
+            logging.error(f"Invalid Misskey username: {self.misskey_user}")
+            return None, f"Invalid Misskey username: {self.misskey_user}. Must be in format username@instance.com"
+        
+        logging.info(f"Fetching Pleroma user profile for {self.misskey_user} to find Misskey post: {self.misskey_url}")
+        post_time = datetime.now(timezone.utc)
+        try:
+            # Search for the Misskey user on Pleroma
+            response = requests.get(
+                f"{self.instance_url}/api/v1/accounts/search",
+                headers={"Authorization": f"Bearer {self.access_token}"},
+                params={"q": self.misskey_user, "limit": 1},
+                timeout=15  # Increased timeout to handle network issues
+            )
+            if response.status_code != 200:
+                return None, f"Failed to search Pleroma user profile: {response.status_code} - {response.json()}"
+            users = response.json()
+            if not users or not isinstance(users, list) or len(users) == 0:
+                return None, f"No user found for {self.misskey_user} in Pleroma search. Ensure Pleroma account follows {self.misskey_user} at https://fedi.nekos.farm/users/{self.misskey_user}."
+            user_id = users[0].get("id")
+            if not user_id:
+                return None, f"No user ID found for {self.misskey_user} in Pleroma profile"
+
+            # Fetch the user's recent public statuses
+            response = requests.get(
+                f"{self.instance_url}/api/v1/accounts/{user_id}/statuses",
+                headers={"Authorization": f"Bearer {self.access_token}"},
+                params={"limit": 20},  # Increased limit to fetch more posts
+                timeout=15
+            )
+            if response.status_code != 200:
+                return None, f"Failed to fetch Pleroma user statuses: {response.status_code} - {response.json()}"
+            posts = response.json()
+            logging.debug(f"Pleroma statuses fetched for {self.misskey_user}: {len(posts)} posts")
+            for post in posts:
+                post_text = html.unescape(re.sub(r'<[^>]+>', '', post.get("content", "").strip()))
+                post_visibility = post.get("visibility")
+                created_at_str = post.get("created_at", "")
+                if not created_at_str:
+                    logging.warning(f"Skipping post {post.get('id')} with missing created_at")
+                    continue
+                try:
+                    post_created_at = parse(created_at_str).replace(tzinfo=timezone.utc)
+                    time_diff = (post_time - post_created_at).total_seconds()
+                    # Check if post matches by URL or content, and is recent (within 120 seconds)
+                    if (self.misskey_url in post_text or self.status_text in post_text) and post_visibility == "public" and time_diff < 120:
+                        logging.info(f"Found matching Pleroma post: {post['id']}")
+                        return post["id"], None
+                except ValueError as e:
+                    logging.warning(f"Failed to parse created_at for post {post.get('id')}: {str(e)}")
+                    continue
+            return None, f"Misskey post not found in Pleroma for user {self.misskey_user}. Ensure the post has federated and is visible at https://fedi.nekos.farm/users/{self.misskey_user}."
+        except requests.RequestException as e:
+            logging.error(f"Network error fetching Pleroma user profile/statuses: {str(e)}")
+            return None, f"Network error fetching Pleroma user profile/statuses: {str(e)}"
 
 class PleromaClientGUI(QMainWindow):
     def __init__(self):
@@ -470,41 +560,85 @@ class PleromaClientGUI(QMainWindow):
         logging.error(f"Misskey post not found in Pleroma user profile after {max_attempts} attempts")
         return None, f"Misskey post not found in Pleroma user profile after {max_attempts} attempts. Ensure Pleroma recognizes the Misskey user ({self.misskey_user}) at https://fedi.nekos.farm/users/{self.misskey_user} or search for {self.misskey_user} and check federation."
 
-def find_misskey_note(instance_url, access_token, post_url, post_text, username):
+def find_misskey_note(instance_url, access_token, pleroma_url, status_text, pleroma_username):
+    logging.info(f"Fetching most recent Misskey note for user: {pleroma_username}")
+    if not pleroma_username or "@" not in pleroma_username:
+        logging.error(f"Invalid Pleroma username: {pleroma_username}")
+        return None, f"Invalid Pleroma username: {pleroma_username}. Must be in format username@instance.com"
+
+    # Parse username and host
     try:
-        logging.info(f"Searching for Misskey note with URL: {post_url}, text: {post_text[:50]}..., username: {username}")
+        username, host = pleroma_username.split("@")[0], pleroma_username.split("@")[1]
+        logging.debug(f"Parsed username: {username}, host: {host}")
+    except (IndexError, ValueError) as e:
+        logging.error(f"Failed to parse Pleroma username {pleroma_username}: {str(e)}")
+        return None, f"Failed to parse Pleroma username {pleroma_username}: {str(e)}"
+
+    post_time = datetime.now(timezone.utc)
+    try:
+        # Search for the user using /api/users/search-by-username-and-host
         response = requests.post(
-            f"{instance_url}/api/notes/search",
-            headers={"Content-Type": "application/json"},
-            json={"i": access_token, "query": post_url, "limit": 10},
-            timeout=10
+            f"{instance_url}/api/users/search-by-username-and-host",
+            json={"username": username, "host": host},
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=15
         )
         if response.status_code != 200:
-            logging.error(f"Misskey note search failed: {response.status_code} - {response.text}")
-            return None, f"Misskey note search failed: {response.status_code} - {response.text}"
-        
+            logging.error(f"Misskey user search-by-username-and-host failed: {response.status_code} - {response.json()}")
+            return None, f"Misskey user search-by-username-and-host failed: {response.status_code} - {response.json()}"
+        users = response.json()
+        logging.debug(f"Misskey user search-by-username-and-host response: {users}")
+        if not users or not isinstance(users, list) or len(users) == 0:
+            logging.error(f"No user found for username: {username}, host: {host} in Misskey search. Ensure Misskey account follows Pleroma user at https://frennet.xyz/@{pleroma_username}.")
+            return None, f"No user found for username: {username}, host: {host} in Misskey search. Ensure Misskey account follows Pleroma user at https://frennet.xyz/@{pleroma_username}."
+        user_id = users[0].get("id")
+        if not user_id:
+            logging.error(f"No user ID found for {pleroma_username} in Misskey profile")
+            return None, f"No user ID found for {pleroma_username} in Misskey profile"
+
+        # Fetch the user's recent public notes without filtering for files
+        time.sleep(2)  # 2-second delay after Pleroma upload
+        response = requests.post(
+            f"{instance_url}/api/users/notes",
+            json={"userId": user_id, "limit": 5},
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=15
+        )
+        if response.status_code != 200:
+            logging.error(f"Misskey user notes fetch failed: {response.status_code} - {response.json()}")
+            return None, f"Misskey user notes fetch failed: {response.status_code} - {response.json()}"
         notes = response.json()
-        if not notes:
-            logging.warning(f"No Misskey notes found for URL: {post_url}")
-            return None, "No matching Misskey note found. The post may not have propagated yet."
+        if not notes or not isinstance(notes, list) or len(notes) == 0:
+            logging.error(f"No notes found for {pleroma_username} in Misskey. Ensure the post has federated to https://frennet.xyz/@{pleroma_username}.")
+            return None, f"No notes found for {pleroma_username} in Misskey. Ensure the post has federated to https://frennet.xyz/@{pleroma_username}."
+        
+        # Log all notes for debugging
+        logging.debug(f"Fetched notes: {notes}")
 
+        # Find the matching note by text content
         for note in notes:
-            if note is None:
-                logging.warning("Encountered None note in Misskey search results")
+            note_text = html.unescape(re.sub(r'<[^>]+>', '', note.get("text", "") or "").strip())
+            logging.debug(f"Note ID: {note.get('id')}, Processed text: {note_text}")
+            note_visibility = note.get("visibility")
+            created_at_str = note.get("createdAt", "")
+            if not created_at_str:
+                logging.warning(f"Skipping note {note.get('id')} with missing createdAt")
                 continue
-            note_text = note.get("text", "" if note.get("text") is None else note.get("text")).strip()
-            note_user = note.get("user", {}).get("username", "")
-            note_host = note.get("user", {}).get("host", "")
-            note_full_username = f"{note_user}@{note_host}" if note_host else note_user
-            if post_url in note_text and note_full_username == username:
-                logging.info(f"Found matching Misskey note: {note['id']}")
-                return note["id"], None
-        logging.warning(f"No matching Misskey note found for URL: {post_url}, username: {username}")
-        return None, "No matching Misskey note found. Check username or post content."
+            try:
+                note_created_at = parse(created_at_str).replace(tzinfo=timezone.utc)
+                time_diff = (post_time - note_created_at).total_seconds()
+                if status_text.strip() in note_text and note_visibility == "public" and time_diff < 120:
+                    logging.info(f"Found matching Misskey note: {note['id']}")
+                    return note["id"], None
+            except ValueError as e:
+                logging.warning(f"Failed to parse createdAt for note {note.get('id')}: {str(e)}")
+                continue
+        logging.error(f"No matching note found for {pleroma_username} in Misskey. Ensure the post has federated to https://frennet.xyz/@{pleroma_username}.")
+        return None, f"No matching note found for {pleroma_username} in Misskey. Ensure the post has federated to https://frennet.xyz/@{pleroma_username}."
     except requests.RequestException as e:
-        logging.error(f"Misskey note search failed: Network error: {str(e)}")
-        return None, f"Misskey note search failed: Network error: {str(e)}"
-
+        logging.error(f"Network error fetching Misskey user profile/notes: {str(e)}")
+        return None, f"Network error fetching Misskey user profile/notes: {str(e)}"
+    
 def renote_to_misskey(instance_url, access_token, note_id):
     try:
         logging.info(f"Renoting Misskey note: note_id={note_id}")
@@ -728,7 +862,7 @@ class XAPIDialog(QDialog):
 class HelpDialog(QDialog):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Help - Social Media Client")
+        self.setWindowTitle("Help - poster")
         self.setFixedSize(400, 300)
         layout = QVBoxLayout()
 
@@ -767,7 +901,7 @@ class HelpDialog(QDialog):
 class PleromaClientGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Social Media Client")
+        self.setWindowTitle("poster")
         self.setFixedSize(400, 520)
 
         # Menu bar
@@ -1138,9 +1272,15 @@ class PleromaClientGUI(QMainWindow):
                 return
 
         elif self.crosspost_mode == "pleroma_to_misskey":
-            if not self.pleroma_checkbox.isChecked() or not pleroma_creds.get("access_token"):
-                self.status_label.setText("Error: Pleroma not configured or disabled.")
-                logging.error("Pleroma to Misskey repost failed: Pleroma not configured or disabled")
+            logging.debug("Entering pleroma_to_misskey mode")
+            if not self.pleroma_checkbox.isChecked():
+                self.status_label.setText("Error: Pleroma checkbox not selected.")
+                logging.error("Pleroma to Misskey repost failed: Pleroma checkbox not selected")
+                self.post_button.setEnabled(True)
+                return
+            if not pleroma_creds.get("access_token"):
+                self.status_label.setText("Error: Pleroma access token not configured.")
+                logging.error("Pleroma to Misskey repost failed: Pleroma access token not configured")
                 self.post_button.setEnabled(True)
                 return
             if not pleroma_creds.get("username"):
@@ -1148,67 +1288,101 @@ class PleromaClientGUI(QMainWindow):
                 logging.error("Pleroma to Misskey repost failed: Pleroma username not configured")
                 self.post_button.setEnabled(True)
                 return
+            logging.debug(f"Pleroma credentials: {pleroma_creds}")
 
             media_ids = []
             for media_path in self.media_paths:
-                media_id, error = upload_pleroma_media(pleroma_creds["instance_url"], pleroma_creds["access_token"], media_path)
-                if error:
-                    self.status_label.setText(f"Error: {error}")
+                logging.debug(f"Uploading media to Pleroma: {media_path}")
+                try:
+                    media_id, error = upload_pleroma_media(pleroma_creds["instance_url"], pleroma_creds["access_token"], media_path)
+                    if error:
+                        self.status_label.setText(f"Error uploading media to Pleroma: {error}")
+                        logging.error(f"Error uploading media to Pleroma: {error}")
+                        self.post_button.setEnabled(True)
+                        return
+                    media_ids.append(media_id)
+                except Exception as e:
+                    self.status_label.setText(f"Unexpected error uploading media to Pleroma: {str(e)}")
+                    logging.error(f"Unexpected error uploading media to Pleroma: {str(e)}")
                     self.post_button.setEnabled(True)
                     return
-                media_ids.append(media_id)
-            pleroma_url, _, error = post_to_pleroma(pleroma_creds["instance_url"], pleroma_creds["access_token"], status_text, media_ids)
-            if error:
-                self.status_label.setText(f"Error: {error}")
+            logging.debug(f"Posting to Pleroma with status: {status_text}, media_ids: {media_ids}")
+            try:
+                pleroma_url, pleroma_post_id, error = post_to_pleroma(pleroma_creds["instance_url"], pleroma_creds["access_token"], status_text, media_ids)
+                if error:
+                    self.status_label.setText(f"Error posting to Pleroma: {error}")
+                    logging.error(f"Error posting to Pleroma: {error}")
+                    self.post_button.setEnabled(True)
+                    return
+                posted_services.append(f"Pleroma: {pleroma_url}")
+                original_account = "Pleroma"
+            except Exception as e:
+                self.status_label.setText(f"Unexpected error posting to Pleroma: {str(e)}")
+                logging.error(f"Unexpected error posting to Pleroma: {str(e)}")
                 self.post_button.setEnabled(True)
                 return
-            posted_services.append(f"Pleroma: {pleroma_url}")
-            original_account = "Pleroma"
 
             if self.x_checkbox.isChecked() and x_creds.get("api_key"):
-                success, error = post_to_x(self.media_paths, status_text, pleroma_url, x_creds)
-                if error:
-                    self.status_label.setText(f"Error posting to X: {error}")
+                logging.debug(f"Posting to X with status: {status_text}, media: {self.media_paths}")
+                try:
+                    success, error = post_to_x(self.media_paths, status_text, pleroma_url, x_creds)
+                    if error:
+                        self.status_label.setText(f"Error posting to X: {error}")
+                        logging.error(f"Error posting to X: {error}")
+                        self.post_button.setEnabled(True)
+                        return
+                    posted_services.append("X")
+                    self.update_x_post_count_label(load_credentials())
+                except Exception as e:
+                    self.status_label.setText(f"Unexpected error posting to X: {str(e)}")
+                    logging.error(f"Unexpected error posting to X: {str(e)}")
                     self.post_button.setEnabled(True)
                     return
-                posted_services.append("X")
-                self.update_x_post_count_label(load_credentials())
 
             if self.misskey_checkbox.isChecked() and misskey_creds.get("access_token"):
-                note_id, error = find_misskey_note(
-                    misskey_creds["instance_url"], misskey_creds["access_token"], pleroma_url, status_text, pleroma_creds["username"]
-                )
-                if error or not note_id:
-                    logging.warning(f"Failed to find Misskey note: {error}. Posting as new note.")
-                    media_ids = []
-                    for media_path in self.media_paths:
-                        media_id, error = upload_misskey_media(misskey_creds["instance_url"], misskey_creds["access_token"], media_path)
-                        if error:
-                            self.status_label.setText(f"Error: {error}")
-                            self.post_button.setEnabled(True)
-                            return
-                        media_ids.append(media_id)
-                    misskey_url, _, error = post_to_misskey(
-                        misskey_creds["instance_url"], misskey_creds["access_token"], 
-                        f"{status_text} {pleroma_url}", media_ids
-                    )
-                    if error:
-                        self.status_label.setText(f"Error posting to Misskey: {error}")
+                logging.debug(f"Attempting to renote Pleroma post in Misskey: {pleroma_url}")
+                max_attempts = 3  # Reduced attempts since we’re taking the latest post
+                for attempt in range(max_attempts):
+                    try:
+                        note_id, error = find_misskey_note(
+                            misskey_creds["instance_url"], misskey_creds["access_token"], pleroma_url, status_text, pleroma_creds["username"]
+                        )
+                        if note_id:
+                            success, error = renote_to_misskey(misskey_creds["instance_url"], misskey_creds["access_token"], note_id)
+                            if error:
+                                self.status_label.setText(f"Error renoting to Misskey: {error}")
+                                logging.error(f"Error renoting to Misskey: {error}")
+                                self.post_button.setEnabled(True)
+                                return
+                            posted_services.append("Misskey (renote)")
+                            break
+                        else:
+                            logging.warning(f"Attempt {attempt + 1}/{max_attempts} failed to find Misskey note: {error}")
+                            if attempt < max_attempts - 1:
+                                time.sleep(2)  # Additional 2-second delay between attempts
+                    except Exception as e:
+                        logging.error(f"Unexpected error searching Misskey note: {str(e)}")
+                        self.status_label.setText(f"Unexpected error searching Misskey note: {str(e)}")
                         self.post_button.setEnabled(True)
                         return
-                    posted_services.append(f"Misskey: {misskey_url}")
                 else:
-                    success, error = renote_to_misskey(misskey_creds["instance_url"], misskey_creds["access_token"], note_id)
-                    if error:
-                        self.status_label.setText(f"Error renoting to Misskey: {error}")
-                        self.post_button.setEnabled(True)
-                        return
-                    posted_services.append("Misskey (renote)")
+                    self.status_label.setText(
+                        f"Error: Could not find Pleroma post in Misskey after {max_attempts} attempts. Ensure Misskey account follows Pleroma user ({pleroma_creds['username']}) at https://frennet.xyz/@{pleroma_creds['username']}."
+                    )
+                    logging.error(f"Failed to find Misskey note after {max_attempts} attempts: {error}")
+                    self.post_button.setEnabled(True)
+                    return
 
         elif self.crosspost_mode == "misskey_to_pleroma":
-            if not self.misskey_checkbox.isChecked() or not misskey_creds.get("access_token"):
-                self.status_label.setText("Error: Misskey not configured or disabled.")
-                logging.error("Misskey to Pleroma repost failed: Misskey not configured or disabled")
+            logging.debug("Entering misskey_to_pleroma mode")
+            if not self.misskey_checkbox.isChecked():
+                self.status_label.setText("Error: Misskey checkbox not selected.")
+                logging.error("Misskey to Pleroma repost failed: Misskey checkbox not selected")
+                self.post_button.setEnabled(True)
+                return
+            if not misskey_creds.get("access_token"):
+                self.status_label.setText("Error: Misskey access token not configured.")
+                logging.error("Misskey to Pleroma repost failed: Misskey access token not configured")
                 self.post_button.setEnabled(True)
                 return
             if not misskey_creds.get("username"):
@@ -1216,33 +1390,59 @@ class PleromaClientGUI(QMainWindow):
                 logging.error("Misskey to Pleroma repost failed: Misskey username not configured")
                 self.post_button.setEnabled(True)
                 return
+            logging.debug(f"Misskey credentials: {misskey_creds}")
 
             media_ids = []
             for media_path in self.media_paths:
-                media_id, error = upload_misskey_media(misskey_creds["instance_url"], misskey_creds["access_token"], media_path)
-                if error:
-                    self.status_label.setText(f"Error: {error}")
+                logging.debug(f"Uploading media to Misskey: {media_path}")
+                try:
+                    media_id, error = upload_misskey_media(misskey_creds["instance_url"], misskey_creds["access_token"], media_path)
+                    if error:
+                        self.status_label.setText(f"Error uploading media to Misskey: {error}")
+                        logging.error(f"Error uploading media to Misskey: {error}")
+                        self.post_button.setEnabled(True)
+                        return
+                    media_ids.append(media_id)
+                except Exception as e:
+                    self.status_label.setText(f"Unexpected error uploading media to Misskey: {str(e)}")
+                    logging.error(f"Unexpected error uploading media to Misskey: {str(e)}")
                     self.post_button.setEnabled(True)
                     return
-                media_ids.append(media_id)
-            misskey_url, misskey_note_id, error = post_to_misskey(misskey_creds["instance_url"], misskey_creds["access_token"], status_text, media_ids)
-            if error:
-                self.status_label.setText(f"Error: {error}")
+            logging.debug(f"Posting to Misskey with status: {status_text}, media_ids: {media_ids}")
+            try:
+                misskey_url, misskey_note_id, error = post_to_misskey(misskey_creds["instance_url"], misskey_creds["access_token"], status_text, media_ids)
+                if error:
+                    self.status_label.setText(f"Error posting to Misskey: {error}")
+                    logging.error(f"Error posting to Misskey: {error}")
+                    self.post_button.setEnabled(True)
+                    return
+                posted_services.append(f"Misskey: {misskey_url}")
+                original_account = "Misskey"
+            except Exception as e:
+                self.status_label.setText(f"Unexpected error posting to Misskey: {str(e)}")
+                logging.error(f"Unexpected error posting to Misskey: {str(e)}")
                 self.post_button.setEnabled(True)
                 return
-            posted_services.append(f"Misskey: {misskey_url}")
-            original_account = "Misskey"
 
             if self.x_checkbox.isChecked() and x_creds.get("api_key"):
-                success, error = post_to_x(self.media_paths, status_text, misskey_url, x_creds)
-                if error:
-                    self.status_label.setText(f"Error posting to X: {error}")
+                logging.debug(f"Posting to X with status: {status_text}, media: {self.media_paths}")
+                try:
+                    success, error = post_to_x(self.media_paths, status_text, misskey_url, x_creds)
+                    if error:
+                        self.status_label.setText(f"Error posting to X: {error}")
+                        logging.error(f"Error posting to X: {error}")
+                        self.post_button.setEnabled(True)
+                        return
+                    posted_services.append("X")
+                    self.update_x_post_count_label(load_credentials())
+                except Exception as e:
+                    self.status_label.setText(f"Unexpected error posting to X: {str(e)}")
+                    logging.error(f"Unexpected error posting to X: {str(e)}")
                     self.post_button.setEnabled(True)
                     return
-                posted_services.append("X")
-                self.update_x_post_count_label(load_credentials())
 
             if self.pleroma_checkbox.isChecked() and pleroma_creds.get("access_token"):
+                logging.debug(f"Starting PleromaPostThread for Misskey post: {misskey_url}")
                 self.thread = PleromaPostThread(
                     pleroma_creds["instance_url"], pleroma_creds["access_token"], misskey_url, status_text, misskey_creds["username"]
                 )
