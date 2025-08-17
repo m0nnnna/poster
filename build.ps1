@@ -22,24 +22,24 @@ Remove-Item -Recurse -Force -ErrorAction SilentlyContinue dist, build, *.spec
 # Run PyInstaller to create a single .exe
 Write-Host "Building executable..."
 pyinstaller --onefile `
-    --name SocialMediaClient `
+    --name poster `
     --add-data "client.log;." `
     --log-level WARN `
-    pleroma_client_gui.py
+    poster.py
 
 # Check if build was successful
 if ($LASTEXITCODE -eq 0) {
-    Write-Host "Build successful! Executable is located at: dist\SocialMediaClient.exe" -ForegroundColor Green
+    Write-Host "Build successful! Executable is located at: dist\poster.exe" -ForegroundColor Green
     
     # Copy the .exe to the current directory
     Write-Host "Copying executable to current directory..."
-    Copy-Item -Path "dist\SocialMediaClient.exe" -Destination "."
+    Copy-Item -Path "dist\poster.exe" -Destination "."
     
     # Clean up build artifacts
     Write-Host "Cleaning up build artifacts..."
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue dist, build, *.spec
     
-    Write-Host "Build complete. Run SocialMediaClient.exe to start the application."
+    Write-Host "Build complete. Run poster.exe to start the application."
     Write-Host "Credentials will be stored in social_credentials.enc in the same directory."
     Write-Host "Fernet key will be stored in fernet_key.key. Keep this file secure and do not delete it!"
 } else {

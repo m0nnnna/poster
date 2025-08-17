@@ -743,7 +743,7 @@ class HelpDialog(QDialog):
             "<li>Crosspost modes: Total, Pleroma to Misskey, Misskey to Pleroma.</li>"
             "</ul>"
             "<p><b>GitHub Repository:</b><br>"
-            "<a href='https://github.com/yourusername/social-media-client'>https://github.com/yourusername/social-media-client</a></p>"
+            "<a href='https://github.com/m0nnnna/poster'>Poster</a></p>"
             "<p><b>Credits:</b><br>"
             "Developed by FrenSoft.<br>"
             "Made with Python & love.<br>"
