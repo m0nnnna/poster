@@ -21,7 +21,7 @@ Remove-Item -Recurse -Force -ErrorAction SilentlyContinue dist, build, *.spec
 
 # Run PyInstaller to create a single .exe
 Write-Host "Building executable..."
-pyinstaller --onefile `
+pyinstaller --onefile --noconsole `
     --name poster `
     --add-data "client.log;." `
     --log-level WARN `
